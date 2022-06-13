@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+# version 1.0
+
 import os
+import os.path
 import sys
 import json
 import argparse
+import logging
 from twisted.internet import reactor
 from twisted.internet.defer import inlineCallbacks
 from autobahn.twisted.wamp import ApplicationSession, ApplicationRunner
@@ -40,22 +44,26 @@ class Component(ApplicationSession):
 
         try:
             datas = json.dumps(input_data)
-            print("Input data: {}".format(datas))
+            #print("Input data: {}".format(datas))
+            logging.debug("Input data: {}".format(datas))
 
             res = yield self.call(u'cbz.distro.setup', datas)
-            print("Setup:")  # print("Prepare: {}".format(res))
+            #print("Setup:")  # print("Prepare: {}".format(res))
+            logging.debug("Setup:")
 
             fd = os.dup(1)
             os.write(fd, (res + "\n").encode())
             os.close(fd)
 
         except Exception as e:
-            print("Error: {}".format(e))
+            #print("Error: {}".format(e))
+            logging.debug("Error: {}".format(e))
 
         yield self.leave()
 
     def onDisconnect(self):
-        print("disconnected")
+        #print("disconnected")
+        logging.debug("disconnected")
         reactor.stop()
 
 
@@ -111,6 +119,11 @@ def set_input_data(vargs):
 
 
 def main():
+
+    logfile = "./log/distrib_exec.log"
+    FORMAT = '%(asctime)s - %(name)s - %(levelname)s :: %(message)s'
+    logging.basicConfig(filename=logfile, level=logging.DEBUG,
+                        format=FORMAT, datefmt='%Y%m%d %H:%M:%S')
     args = cmdline()
 
     set_input_data(vars(args))
@@ -118,6 +131,31 @@ def main():
     if args.show_data:
         print("Data: {}".format(json.dumps(input_data)))
         return
+
+    if args.manual_run: # create a file to flag cvrp was run
+        logging.debug("manual run...creating flag file")
+        #print("manual run...creating flag file")
+        try:
+            with open('./log/.distrib.flag', 'w') as f:
+                f.write('True')
+                f.close()
+                logging.debug("./log/.distrib.flag written")
+        except FileNotFoundError:
+            #print("The './log/.distrib.flag' file cant be created")
+            logging.debug("The './log/.distrib.flag' file cant be created")
+    else: # run from crontab
+        #print("executed from crontab... checking if manual run preceeded ....")
+        logging.debug("executed from crontab... checking if manual run preceeded ....")
+        file_exists = os.path.exists('./log/.distrib.flag')
+        if file_exists:
+            #print("manual run preceeded, doing nothing...")
+            logging.debug("manual run preceeded, doing nothing, just removing flag file...")
+            os.remove('./log/.distrib.flag')
+            return
+        else:
+            #print("no manual run preceeded, runninig crontab...")
+            logging.debug("no manual run preceeded, runninig crontab...")
+
 
     router = u"ws://localhost:8080/ws"
     #router = u"wss://be.cibeez.dev.helmes.ee:8443/ws"
