@@ -1,7 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-# version 1.2 - using db flg 'MB_distrib_exec_manual_run'
+# -------------------------------------------------------------------------------------------------------------------------
+#   distrib_script
+#                   controls manual and automatic (crontab) exec of CVRP
+#                   to avoid multiple exec the same day: manual and auto
+#
+#   version     1.2 - using db flg 'MB_distrib_exec_manual_run'
+#               1.3 - use manual exec date in   'MB_distrib_exec_manual_run'
+# --------------------------------------------------------------------------------------------------------------------------
+
+
+VERSION = '1.3'
 
 
 import os
@@ -16,6 +26,7 @@ from twisted.internet.defer import inlineCallbacks
 from autobahn.twisted.wamp import ApplicationSession, ApplicationRunner
 import mysql.connector
 from mysql.connector import errorcode
+import datetime as dt
 
 
 # hack: python2/3 comattibility: remove later
@@ -57,7 +68,7 @@ def init_db():
     # -------------------------------------------------------------
     # this peace of code is used only when testing from a client
     # -------------------------------------------------------------
-    logging.debug("Executed from " + _platform + " machine ", 'debug')
+    logging.debug("Executed from " + _platform + " machine ")
     # when using from client, set to your own config
     ssh_tunnel_host = None
     try:
@@ -191,11 +202,11 @@ def set_input_data(vargs):
 def main():
     cwd = os.getcwd()
     logfile = os.path.join(cwd, "log/distrib_exec.log")
-    #logfile = "./log/distrib_exec.log"
     FORMAT = '%(asctime)s - %(name)s - %(levelname)s :: %(message)s'
     logging.basicConfig(filename=logfile, level=logging.DEBUG,
                         format=FORMAT, datefmt='%Y%m%d %H:%M:%S')
 
+    logging.debug("{0} version: {1}".format(os.path.basename(sys.argv[0]),VERSION))
     # init db
     db_connector, ssh_tunnel_host, server = init_db()
     if db_connector is None:
@@ -211,10 +222,11 @@ def main():
         print("Data: {}".format(json.dumps(input_data)))
         return
 
+    today = dt.datetime.now().strftime("%Y-%m-%d")
     if args.manual_run: # set flag and continue execution
         logging.debug("manual run...update 'MB_distrib_exec_manual_run'  flag file")
         mycursor = db_connector.cursor()
-        sql = "UPDATE configs SET value = '1'  WHERE field = 'MB_distrib_exec_manual_run'  ;"
+        sql = "UPDATE configs SET value = '{0}'  WHERE field = 'MB_distrib_exec_manual_run'  ;".format(today)
         mycursor.execute(sql)
         db_connector.commit()
         db_connector.close()
@@ -227,14 +239,15 @@ def main():
         mycursor.execute(sql)
         #db_connector.commit()
         myresult = mycursor.fetchall()
-        flag = int(myresult[0][0])
+        flag_date = str(myresult[0][0])
+        flag = (today == flag_date) #  if new day with crontab
         logging.debug("'MB_distrib_exec_manual_run flag' : {0} ".format(flag))
         if flag: # manual run preceeded, clear flag and exit
-            logging.debug("manual run preceeded, doing nothing, just resetting 'MB_distrib_exec_manual_run' flag to '0'...")
-            mycursor = db_connector.cursor()
-            sql = "UPDATE configs SET value = '0'  WHERE field = 'MB_distrib_exec_manual_run'  ;"
-            mycursor.execute(sql)
-            db_connector.commit()
+            logging.debug("manual run preceeded, doing nothing...")
+            #mycursor = db_connector.cursor()
+            #sql = "UPDATE configs SET value = '{0}'  WHERE field = 'MB_distrib_exec_manual_run'  ;".format(today)
+            #mycursor.execute(sql)
+            #db_connector.commit()
             db_connector.close()
             if ssh_tunnel_host: server.stop()
             return
