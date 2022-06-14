@@ -1,17 +1,21 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-# version 1.0
+# version 1.2 - using db flg 'MB_distrib_exec_manual_run'
+
 
 import os
 import os.path
 import sys
+from sys import platform as _platform
 import json
 import argparse
 import logging
 from twisted.internet import reactor
 from twisted.internet.defer import inlineCallbacks
 from autobahn.twisted.wamp import ApplicationSession, ApplicationRunner
+import mysql.connector
+from mysql.connector import errorcode
 
 
 # hack: python2/3 comattibility: remove later
@@ -35,6 +39,72 @@ input_data = {
     "areas": None,
     "email_list": None
 }
+
+def init_db():
+    # db config , iniot db connector and sshtunnel
+    #wd = os.environ.get('DSS_WD', '.')
+    cwd = os.getcwd()
+    option_files = os.path.join(cwd, "config/dss-mysql.cnf")
+    if not os.path.isfile(option_files):
+        logging.debug('ERR missing dss-mysql.cnf configuraion file ')
+        return None, None, None
+
+    config = {
+        'option_files': option_files,  # "'dss-mysql.cnf',
+        'option_groups': ['Client', 'DSS']
+    }
+
+    # -------------------------------------------------------------
+    # this peace of code is used only when testing from a client
+    # -------------------------------------------------------------
+    logging.debug("Executed from " + _platform + " machine ", 'debug')
+    # when using from client, set to your own config
+    ssh_tunnel_host = None
+    try:
+        ssh_tunnel_host = os.environ['DSS_TUNNEL_HOST']
+        ssh_private_key = '/Users/pessyhollander/.ssh/id_rsa'
+        ssh_username = 'pessyhollander'
+    except:
+        pass
+
+    server = None
+
+    if ssh_tunnel_host:
+        import sshtunnel
+        logging.debug("Initiating sshtunnel from a MAC OS machine ")
+        print("Initiating sshtunnel from a MAC OS machine ")
+        try:
+            server = sshtunnel.SSHTunnelForwarder(
+                (ssh_tunnel_host, 22),
+                ssh_private_key=ssh_private_key,
+                ssh_username=ssh_username,
+                remote_bind_address=('127.0.0.1', 3306),
+            )
+            server.start()
+            connected_port = server.local_bind_port
+            logging.debug("connected to port: {0}".format(connected_port))
+        except Exception as e:
+            logging.debug('sshtunnel forwarding failed: {0}'.format(e))
+            return None, None, None
+
+        config['host'] = '127.0.0.1'
+        config['port'] = connected_port
+    # ------------------------------------------------------------
+
+    try:
+        db_connector = mysql.connector.connect(**config)
+        logging.debug("Connected to db, db connection: {0}".format(db_connector))
+    except mysql.connector.Error as err:
+        if err.errno == errorcode.ER_ACCESS_DENIED_ERROR:
+            logging.debug("ERR: (mysql.connector) Something is wrong with your user name or password. err: ֻֻ{0}".format(
+                err.errno))
+        elif err.errno == errorcode.ER_BAD_DB_ERROR:
+            logging.debug("ERR: (mysql.connector) Database does not exist. err: ֻֻ{0}".format(err.errno), 'debug')
+        else:
+            logging.debug("ERR: (mysql.connector) {0}".format(err))
+        return None, None, None
+
+    return db_connector, ssh_tunnel_host, server
 
 
 class Component(ApplicationSession):
@@ -119,11 +189,20 @@ def set_input_data(vargs):
 
 
 def main():
-
-    logfile = "./log/distrib_exec.log"
+    cwd = os.getcwd()
+    logfile = os.path.join(cwd, "log/distrib_exec.log")
+    #logfile = "./log/distrib_exec.log"
     FORMAT = '%(asctime)s - %(name)s - %(levelname)s :: %(message)s'
     logging.basicConfig(filename=logfile, level=logging.DEBUG,
                         format=FORMAT, datefmt='%Y%m%d %H:%M:%S')
+
+    # init db
+    db_connector, ssh_tunnel_host, server = init_db()
+    if db_connector is None:
+        logging.debug("init_db() failed, terminating ....")
+        return
+
+    # read cmdline args
     args = cmdline()
 
     set_input_data(vars(args))
@@ -133,29 +212,57 @@ def main():
         return
 
     if args.manual_run: # create a file to flag cvrp was run
-        logging.debug("manual run...creating flag file")
+        logging.debug("manual run...update 'MB_distrib_exec_manual_run'  flag file")
+        mycursor = db_connector.cursor()
+        sql = "UPDATE configs SET value = '1'  WHERE field = 'MB_distrib_exec_manual_run'  ;"
+        mycursor.execute(sql)
+        db_connector.commit()
+
         #print("manual run...creating flag file")
-        try:
-            with open('./log/.distrib.flag', 'w') as f:
-                f.write('True')
-                f.close()
-                logging.debug("./log/.distrib.flag written")
-        except FileNotFoundError:
+
+        #try:
+        #    with open('./log/.distrib.flag', 'w') as f:
+        #        f.write('True')
+        #        f.close()
+        #        logging.debug("./log/.distrib.flag written")
+        #except FileNotFoundError:
             #print("The './log/.distrib.flag' file cant be created")
-            logging.debug("The './log/.distrib.flag' file cant be created")
-    else: # run from crontab
+        #    logging.debug("The './log/.distrib.flag' file cant be created")
+    else: # run from crontab, check if manual run executed before,
         #print("executed from crontab... checking if manual run preceeded ....")
         logging.debug("executed from crontab... checking if manual run preceeded ....")
-        file_exists = os.path.exists('./log/.distrib.flag')
-        if file_exists:
-            #print("manual run preceeded, doing nothing...")
-            logging.debug("manual run preceeded, doing nothing, just removing flag file...")
-            os.remove('./log/.distrib.flag')
+        mycursor = db_connector.cursor()
+        sql = "SELECT value FROM configs WHERE field = 'MB_distrib_exec_manual_run' ;"
+        mycursor.execute(sql)
+        #db_connector.commit()
+        myresult = mycursor.fetchall()
+        flag = int(myresult[0][0])
+        logging.debug("'MB_distrib_exec_manual_run flag' : {0} ".format(flag))
+        if flag: # manual run preceeded, clear flag and exit
+            logging.debug("manual run preceeded, doing nothing, just resetting 'MB_distrib_exec_manual_run' flag to '0'...")
+            mycursor = db_connector.cursor()
+            sql = "UPDATE configs SET value = '0'  WHERE field = 'MB_distrib_exec_manual_run'  ;"
+            mycursor.execute(sql)
+            db_connector.commit()
+            db_connector.close()
+            if ssh_tunnel_host: server.stop()
             return
         else:
-            #print("no manual run preceeded, runninig crontab...")
             logging.debug("no manual run preceeded, runninig crontab...")
+            db_connector.close()
+            if ssh_tunnel_host: server.stop()
 
+
+
+        #file_exists = os.path.exists('./log/.distrib.flag')
+        #if file_exists:
+            #print("manual run preceeded, doing nothing...")
+        #    logging.debug("manual run preceeded, doing nothing, just removing flag file...")
+        #    os.remove('./log/.distrib.flag')
+        #    return
+        #else:
+            #print("no manual run preceeded, runninig crontab...")
+        #    logging.debug("no manual run preceeded, runninig crontab...")
 
     router = u"ws://localhost:8080/ws"
     #router = u"wss://be.cibeez.dev.helmes.ee:8443/ws"
