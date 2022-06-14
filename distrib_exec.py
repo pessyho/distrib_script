@@ -211,25 +211,16 @@ def main():
         print("Data: {}".format(json.dumps(input_data)))
         return
 
-    if args.manual_run: # create a file to flag cvrp was run
+    if args.manual_run: # set flag and continue execution
         logging.debug("manual run...update 'MB_distrib_exec_manual_run'  flag file")
         mycursor = db_connector.cursor()
         sql = "UPDATE configs SET value = '1'  WHERE field = 'MB_distrib_exec_manual_run'  ;"
         mycursor.execute(sql)
         db_connector.commit()
+        db_connector.close()
+        if ssh_tunnel_host: server.stop()
 
-        #print("manual run...creating flag file")
-
-        #try:
-        #    with open('./log/.distrib.flag', 'w') as f:
-        #        f.write('True')
-        #        f.close()
-        #        logging.debug("./log/.distrib.flag written")
-        #except FileNotFoundError:
-            #print("The './log/.distrib.flag' file cant be created")
-        #    logging.debug("The './log/.distrib.flag' file cant be created")
     else: # run from crontab, check if manual run executed before,
-        #print("executed from crontab... checking if manual run preceeded ....")
         logging.debug("executed from crontab... checking if manual run preceeded ....")
         mycursor = db_connector.cursor()
         sql = "SELECT value FROM configs WHERE field = 'MB_distrib_exec_manual_run' ;"
@@ -253,16 +244,6 @@ def main():
             if ssh_tunnel_host: server.stop()
 
 
-
-        #file_exists = os.path.exists('./log/.distrib.flag')
-        #if file_exists:
-            #print("manual run preceeded, doing nothing...")
-        #    logging.debug("manual run preceeded, doing nothing, just removing flag file...")
-        #    os.remove('./log/.distrib.flag')
-        #    return
-        #else:
-            #print("no manual run preceeded, runninig crontab...")
-        #    logging.debug("no manual run preceeded, runninig crontab...")
 
     router = u"ws://localhost:8080/ws"
     #router = u"wss://be.cibeez.dev.helmes.ee:8443/ws"
