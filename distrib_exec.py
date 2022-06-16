@@ -13,7 +13,6 @@
 
 VERSION = '1.3'
 
-
 import os
 import os.path
 import sys
