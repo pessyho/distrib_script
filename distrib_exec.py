@@ -313,12 +313,6 @@ def main():
 
     set_input_data(vars(args))
 
-    pre_process_ok = prepare_manifest_chunk(args.dist_suffix,db_connector)
-    if not pre_process_ok:
-        logging.debug("input prepare_manifest_chunk failed... terminating ")
-        return
-
-
     if args.show_data:
         print("Data: {}".format(json.dumps(input_data)))
         return
@@ -328,6 +322,14 @@ def main():
 
 
     if args.manual_run: # set flag and continue execution
+
+        # manual run, prepare chunk
+        pre_process_ok = prepare_manifest_chunk(args.dist_suffix, db_connector)
+        if not pre_process_ok:
+            logging.debug("input prepare_manifest_chunk failed... terminating ")
+            return
+
+
         input_data["reset"] = False # manual run -> no reset
         logging.debug("manual run...update 'MB_distrib_exec_manual_run'  flag file and disable 'reset' ....")
         mycursor = db_connector.cursor()
@@ -365,6 +367,14 @@ def main():
             return
         else:
             logging.debug("no manual run preceeded, runninig crontab...")
+
+            # prepare chunk before execution
+            pre_process_ok = prepare_manifest_chunk(args.dist_suffix, db_connector)
+            if not pre_process_ok:
+                logging.debug("input prepare_manifest_chunk failed... terminating ")
+                return
+
+
             db_connector.close()
             if ssh_tunnel_host: server.stop()
 
