@@ -6,12 +6,21 @@
 #                   controls manual and automatic (crontab) exec of CVRP
 #                   to avoid multiple exec the same day: manual and auto
 #
-#   version     1.2 - using db flg 'MB_distrib_exec_manual_run'
-#               1.3 - use manual exec date in   'MB_distrib_exec_manual_run'
+#   version     1.2     - using db flg 'MB_distrib_exec_manual_run'
+#               1.3     - use manual exec date in   'MB_distrib_exec_manual_run'
+#               1.4     - added check for thurs man run and --no-rest option if manual run
+#               1.5     - cvrp only for a predefined chunk of data, defined in MB_distrib_chunk_sie
+#
 # --------------------------------------------------------------------------------------------------------------------------
 
 
-VERSION = '1.3'
+VERSION = '1.5'
+
+
+# constants for order flag settings
+ORDER_FLAG_PREDEFINED_TW = 0x4
+ORDER_FLAG_DELIVERY_NOTIFIED = 0x1
+ORDER_FLAG_FIXED = 0x8
 
 import os
 import os.path
@@ -25,7 +34,10 @@ from twisted.internet.defer import inlineCallbacks
 from autobahn.twisted.wamp import ApplicationSession, ApplicationRunner
 import mysql.connector
 from mysql.connector import errorcode
+import sqlalchemy
+from sqlalchemy.exc import SQLAlchemyError
 import datetime as dt
+import pandas as pd
 
 
 # hack: python2/3 comattibility: remove later
@@ -53,8 +65,11 @@ input_data = {
 def init_db():
     # db config , iniot db connector and sshtunnel
     #wd = os.environ.get('DSS_WD', '.')
-    cwd = os.getcwd()
-    option_files = os.path.join(cwd, "config/dss-mysql.cnf")
+    #cwd = os.getcwd()
+    if _platform != 'darwin':
+        option_files = "/home/pessyhollander/cibeez/scripts/config/dss-mysql.cnf"  #os.path.join(cwd, "config/dss-mysql.cnf")
+    else:
+        option_files = "./config/dss-mysql.cnf"
     if not os.path.isfile(option_files):
         logging.debug('ERR missing dss-mysql.cnf configuraion file ')
         return None, None, None
@@ -166,22 +181,17 @@ def cmdline():
     parser.add_argument('--no-equalise', dest='equalise', action='store_false',
                         help='Don\'t equalise vehicles capacities')
     parser.add_argument('--no-notify', '-N', dest='notify_customers',
-                        action='store_false',
-                        help='Don\'t notify (send SMS) customers')
-    parser.add_argument('--no-reset', dest='reset', action='store_false',
-                        help='Don\'t reset before CVRP')
-    parser.add_argument('--no-cvrp', dest='cvrp', action='store_false',
-                        help='Don\'t run CVRP')
+                        action='store_false', help='Don\'t notify (send SMS) customers')
+    parser.add_argument('--no-reset', dest='reset', action='store_false', help='Don\'t reset before CVRP')
+    parser.add_argument('--no-cvrp', dest='cvrp', action='store_false', help='Don\'t run CVRP')
     parser.add_argument('--no-update-counters', dest='update_counters',
-                        action='store_false',
-                        help='Don\'t update counters after CVRP')
+                        action='store_false', help='Don\'t update counters after CVRP')
     parser.add_argument('--email_list', '-L', metavar='EMAIL ADDRESSES',
                         help='email addreses list')
     parser.add_argument('--no-email-leftovers', dest='email_leftovers',
                         action='store_false', help='Don\'t send leftover email')
     parser.add_argument('--no-lock-drivers', dest='no_lock_drivers',
-                        action='store_true',
-                        help='Don\'t lock drivers after CVRP')
+                        action='store_true', help='Don\'t lock drivers after CVRP')
     parser.add_argument('--no-email-manifest', dest='email_manifest',
                         action='store_false',
                         help='Don\'t send manifest email')
@@ -198,9 +208,95 @@ def set_input_data(vargs):
             input_data[k] = vargs[k]
 
 
+
+# read the data and prepare for manifest with limited
+def prepare_manifest_chunk(o_type_d, db_connector):
+
+    manifest_df = pd.DataFrame()
+    logging.debug("reading chunk size from config ....")
+    mycursor = db_connector.cursor()
+    sql = "SELECT value FROM configs WHERE field = 'MB_distrib_chunk_size' ;"
+    mycursor.execute(sql)
+    # db_connector.commit()
+    myresult = mycursor.fetchall()
+    chunk_size = int(myresult[0][0])
+    msg = "chunk size defined in 'MB_distrib_chunk_size': {}".format(chunk_size)
+    print(msg)
+    logging.debug(msg)
+
+
+    # sql = "UPDATE orders SET o_order_state = 1, o_vehicle_id = %s, o_seq = %s, o_payment_id = %s WHERE id = %s"
+
+    #db_connector, ssh_tunnel_host, server = init_db()
+
+    try:
+        sql = "SELECT " \
+                "id, o_payment_id, o_req_uid, o_external_id, o_order_state, o_pickup_time_planned, updated_at " \
+                "FROM orders " \
+                "WHERE o_order_state IN (2) " \
+                "AND o_type_d LIKE 'DIST" + str(o_type_d) + "%' " \
+                "AND DATE(orders.updated_at) BETWEEN DATE(SUBDATE(NOW(),2))  AND DATE(CURDATE()) ORDER by orders.o_pickup_time_planned ASC ;"
+        logging.debug("read_sql: {}".format(sql))
+        manifest_df = pd.read_sql(sql, db_connector)
+    except Exception as err:
+        logging.error("prepare_manifest_chunk(), read_sql err: {0}".format(err))
+        return None
+
+    if manifest_df.empty:
+        msg = "prepare_manifest_chunk(), o_type_d: {0} input is empty for date: {1}".format(o_type_d, dt.datetime.now().strftime("%Y-%m-%d"))
+        logging.debug(msg)
+        return None
+    else:
+        msg = "prepare_manifest_chunk() OK, returned {0} records".format(manifest_df.shape[0])
+        print(msg)
+        logging.debug(msg)
+
+
+    cvrp_records = manifest_df.shape[0]
+    if chunk_size > cvrp_records:
+        msg = "chunk size ({0}) > data size ({1}), euqlizing...".format(chunk_size,cvrp_records)
+        print(msg)
+        logging.debug(msg)
+        chunk_size = cvrp_records
+
+
+    # now, reset all orders that shouldnt go into the manifest with o_payment_id = 0x0 and the rest to 0x8
+    #o_req_uid = manifest_df.loc[0:0, 'o_req_uid'].tolist()[0]
+    manifest_df.loc[0:chunk_size, 'o_payment_id'] = 0x0
+    manifest_df.loc[chunk_size:, 'o_payment_id'] = ORDER_FLAG_FIXED
+    msg = "Updating records: 0-{0} with 0x0 and {1}-{2} with  0x8".format(chunk_size,chunk_size, cvrp_records)
+    print(msg)
+    #ids_in_chunck = ','.join([str(e) for e in manifest_df.loc[chunk_size:, 'id'].tolist()])
+    #ids_out_chunck = ','.join([str(e) for e in manifest_df.loc[0:chunk_size, 'id'].tolist()])
+    #sql = "UPDATE orders SET o_payment_id = %s WHERE id IN (%s) AND o_req_uid = %s ; "
+    #data = (o_payment_id, id, o_req_uid)
+
+    for _, row in manifest_df.iterrows():
+        o_payment_id = int(row.o_payment_id)
+        id = int(row.id)
+        o_req_uid = int(row.o_req_uid)
+        sql = "UPDATE orders SET o_payment_id = %s WHERE id = %s AND o_req_uid = %s ; "
+        data = (o_payment_id, id, o_req_uid)
+        try:
+            mycursor.execute(sql, data)
+        except Exception as err:
+            msg = "prepare_manifest_chunk()/UPDATE  Exception: {0}. sql: {1}".format(err, sql)
+            print(msg)
+            logging.error(msg)
+            db_connector.close()
+            return False
+    db_connector.commit()  # commit all updates
+
+
+    return True
+
 def main():
-    cwd = os.getcwd()
-    logfile = os.path.join(cwd, "log/distrib_exec.log")
+    #cwd = os.getcwd()
+    if _platform != 'darwin':
+        logfile = "/home/pessyhollander/cibeez/scripts/log/distrib_exec.log"
+    else:
+        logfile = "./log/distrib_exec.log"
+    #os.chmod(logfile, 0o666) # rw by all
     FORMAT = '%(asctime)s - %(name)s - %(levelname)s :: %(message)s'
     logging.basicConfig(filename=logfile, level=logging.DEBUG,
                         format=FORMAT, datefmt='%Y%m%d %H:%M:%S')
@@ -217,13 +313,23 @@ def main():
 
     set_input_data(vars(args))
 
+    pre_process_ok = prepare_manifest_chunk(args.dist_suffix,db_connector)
+    if not pre_process_ok:
+        logging.debug("input prepare_manifest_chunk failed... terminating ")
+        return
+
+
     if args.show_data:
         print("Data: {}".format(json.dumps(input_data)))
         return
 
+    logging.debug("input data: {}".format((json.dumps(input_data))))
     today = dt.datetime.now().strftime("%Y-%m-%d")
+
+
     if args.manual_run: # set flag and continue execution
-        logging.debug("manual run...update 'MB_distrib_exec_manual_run'  flag file")
+        input_data["reset"] = False # manual run -> no reset
+        logging.debug("manual run...update 'MB_distrib_exec_manual_run'  flag file and disable 'reset' ....")
         mycursor = db_connector.cursor()
         sql = "UPDATE configs SET value = '{0}'  WHERE field = 'MB_distrib_exec_manual_run'  ;".format(today)
         mycursor.execute(sql)
@@ -239,14 +345,21 @@ def main():
         #db_connector.commit()
         myresult = mycursor.fetchall()
         flag_date = str(myresult[0][0])
-        flag = (today == flag_date) #  if new day with crontab
+        # check if a manual run was exec on thursday and now its friday
+        if flag_date != '':
+            is_thur_friday = (dt.datetime.strptime(flag_date, "%Y-%m-%d").weekday() == 3) and (dt.datetime.now().weekday() == 4)
+        else:
+            is_thur_friday = False
+        flag = (today == flag_date) or is_thur_friday  # set flag if manual run already executed
         logging.debug("'MB_distrib_exec_manual_run flag' : {0} ".format(flag))
-        if flag: # manual run preceeded, clear flag and exit
+        if flag:  # manual run preceeded, clear flag and exit
             logging.debug("manual run preceeded, doing nothing...")
-            #mycursor = db_connector.cursor()
-            #sql = "UPDATE configs SET value = '{0}'  WHERE field = 'MB_distrib_exec_manual_run'  ;".format(today)
-            #mycursor.execute(sql)
-            #db_connector.commit()
+            if is_thur_friday:
+                logging.debug("Thursday manual run, clearing 'MB_distrib_exec_manual_run'")
+                mycursor = db_connector.cursor()
+                sql = "UPDATE configs SET value = ''  WHERE field = 'MB_distrib_exec_manual_run'  ;"
+                mycursor.execute(sql)
+                db_connector.commit()
             db_connector.close()
             if ssh_tunnel_host: server.stop()
             return
@@ -254,7 +367,6 @@ def main():
             logging.debug("no manual run preceeded, runninig crontab...")
             db_connector.close()
             if ssh_tunnel_host: server.stop()
-
 
 
     router = u"ws://localhost:8080/ws"
